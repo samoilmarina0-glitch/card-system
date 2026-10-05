@@ -63,6 +63,21 @@ Stored in `system` key-value table via `App\System::_get/_set`; loaded into live
 
 ---
 
+## F4 [HIGH reachability] Unauthenticated purchased-card (卡密) + buyer-PII disclosure (IDOR), unthrottled
+- Reachability: UNAUTH, universal (no config/driver/logged-credential precondition); `api` middleware group = `['bindings']` only → NO throttle.
+- Chain:
+  1. `POST /api/shop/record/get` `{type:"contact", contact:"<victim>"}` → `Shop\Order@get` returns the contact's orders incl. `order_no`, `contact_ext`(_mail/_mobile), `product_name`. Gated by query_password ONLY if `order_query_password_open` (default OFF). type=order_no / type=cookie also return order_no.
+  2. `GET /pay/result/{order_no}` → `Shop\Pay@result` → for `status>=STATUS_SUCCESS(2)` calls `showOrderResult` → `Order::getCardsArray()` = the delivered 卡密. NO ownership/cookie/auth check (relies only on order_no secrecy).
+- order_no = `date('YmdHis')`(14, second-precision) + `str_random(5)`(base62 CSPRNG) = 19 chars. Blind brute ≈ 62^5/second (~916M) → impractical online; but the contact-oracle in step 1 (default-open) yields exact order_no, making theft deterministic for a known/guessed contact (QQ/email), and record/get alone already leaks buyer PII. No rate limit aids enumeration.
+- Impact: theft of the sold product (card secrets) + buyer PII. Not AK/SK, but universally reachable and high business impact for a 发卡 platform.
+- Fix: bind order lookups to the `customer` cookie / require query_password; enforce ownership on `/pay/result`; add throttle to the `api` group; default `order_query_password_open` on.
+
+## Payment gateway (card-gateway submodule @5d179d8) — audited, broadly SOUND
+Highest-reachability unauth surface (`/pay/notify/{pay_id}`, `/pay/return/...`, `/api/qrcode/query/{pay_id}`; attacker picks pay_id→driver). verify($config,$successCallback) ships goods when it returns success.
+- Signature verification present & strict in the common drivers: EPay/CodePay/UigPay/VPay/U9Pay/HLPay/JCBPay/Fakala (md5/sha256 over params + secret key, mostly `===`); Alipay/WeChat/DirectWeChat (RSA/official), AiMing (RSA openssl_private_decrypt), ECPay (CheckMacValue), PayPal/Qf/BTC/MugglePay-query (server-side query). No universal free-order bypass; no attacker-controlled-host SSRF (gateways use config/hardcoded hosts); XXE mitigated (SwiftPass libxml_disable_entity_loader; QPay relies on modern libxml).
+- Residual (enablement-gated, LOW universal reachability): `Demo` driver verify ships UNCONDITIONALLY (`if(1){successCallback}` + hardcoded query `code===0`) → free orders if a Demo channel is ever enabled (test driver). Yeke/others depend on their SDK verify (not fully traced; less common).
+- Structural note: MugglePay callback token = `md5($app_secret . $order_no . config('app.key'))` — ties payment auth to APP_KEY. Combined with JWT secret=APP_KEY, Laravel Crypt=APP_KEY, hashids=APP_KEY: **APP_KEY is the system's single point of failure**. A deterministic unauth APP_KEY disclosure (none found: no unauth file read, APP_DEBUG off by default) would collapse everything (forge admin JWT → system/storage → AK/SK; forge MugglePay token → free orders; decrypt log-viewer `l` → arbitrary file read → bootstrap/cache/config.php → AK/SK).
+
 ## Ruled out (negative results)
 - Shop endpoints (Product@get, Order@get, Coupon@info, Pay@buy): Eloquent `where()` parameterized; `(int)` casts; `whereRaw` strings static → NO SQLi.
 - `Merchant\File@renderImage` (`/storage/{file_path}`): requires `images/` prefix, blocks `..`,`./`,`.\` → NOT arbitrary file read.
