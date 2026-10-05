@@ -86,6 +86,27 @@ Highest-reachability unauth surface (`/pay/notify/{pay_id}`, `/pay/return/...`, 
 - Gateway payment drivers = empty git submodule (app/Library/Gateway) — not present in this checkout.
 - CurlRequest/UrlShorten use mostly hardcoded hosts; no obvious unauth attacker-controlled-host SSRF to metadata.
 
+## DEFINITIVE CONCLUSION — is there a pure-code deterministic unauth → cloud AK/SK? NO.
+The OSS/Qiniu/S3 AK/SK live ONLY in the DB `system` table + runtime `config()` + `settings.all` cache, and are returned by exactly ONE endpoint: `GET /api/admin/system/storage` (admin JWT required). A full-surface audit closes every direct unauth route:
+- No unauth endpoint returns `storage_*` settings (admin System controller is the only reader that outputs them).
+- No settings-key injection: every `System::_get()/_getInt()/config()` in unauth controllers uses a LITERAL key (verified by extracting all call args from Shop/*, Controller, HomeController). No `_get($userInput)` / `config($userInput)` anywhere reachable.
+- No unauth arbitrary file read: `renderImage` is constrained to `images/` + blocks `..`/`./`/`.\`; laravel-log-viewer `l`/`dl` use `Crypt::decrypt` (needs APP_KEY).
+- No attacker-controlled-host SSRF → no cloud-metadata (169.254.169.254) route: gateway + app curl/file_get_contents hosts are all config-set or hardcoded.
+- No config/env dump sink (no phpinfo/dd/var_dump of config|env|$_SERVER in unauth code); no stray PHP in webroot (`public/` has only index.php).
+- Payment gateway driver signatures broadly sound (no universal free-order/SSRF/XXE).
+
+=> AK/SK sit behind the admin-auth boundary. Crossing it unauth reduces to possessing/forging an admin JWT, i.e. to **APP_KEY** (jwt `secret=env('APP_KEY')`; Laravel Crypt, hashids, MugglePay token all derive from APP_KEY). There is NO deterministic unauth APP_KEY disclosure in the code.
+
+### The only unauth → AK/SK routes, all CONDITIONAL (honest, per evidence discipline):
+1. F1+F2 (opportunistic): admin JWT/creds harvested from logs via the unauth log viewer → replay → system/storage. VERIFIED end-to-end; needs a credential to be present in logs.
+2. APP_KEY compromise → forge admin JWT → system/storage (deterministic IF APP_KEY obtainable):
+   - APP_KEY empty (deployer ran `git clone` without `php artisan key:generate`; `.env.example` ships `APP_KEY=`) → JWT HMAC secret is '' → forge `{sub:1}` → admin. [misconfig-gated; needs runtime check that jwt-auth accepts empty secret]
+   - APP_DEBUG=true (not default) → unhandled-exception error page can expose `$_SERVER`/env incl. APP_KEY → forge JWT.
+   - APP_KEY appears in logs (not by default) → F1 reads it → forge JWT, and/or decrypt log-viewer `l` → arbitrary file read → bootstrap/cache/config.php (holds AK/SK after `config:cache`).
+3. Deployment-level (not app code): webroot misconfigured to project root → fetch `.env`; or a public OSS bucket.
+
+Bottom line: a clean "0-click unauth → cloud AK/SK" as a pure application-code bug does NOT exist in this repo. Report this as the finding; do not overstate a conditional chain as deterministic.
+
 ## PRIMARY ANSWER — unauth 0-click chain to AK/SK
 F1 (unauth log viewer) + F2 (headers/body logged on uncaught exceptions):
 1. `GET /api/admin/web/logs/settings.all` → unauth log viewer.
