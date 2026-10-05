@@ -2,6 +2,15 @@
 
 Goal: **unauthenticated, 0-click vulnerability that leaks AK/SK** (cloud storage credentials).
 
+## DYNAMIC VERIFICATION (sandbox, Docker: PHP 7.2.34 + MySQL 5.7, Laravel 5.5.50) — CONFIRMED
+Stack: `thecodingmachine/php:7.2-v4-cli` + `mysql:5.7`, composer install (runtime deps), migrate, seeded 1 admin + 13 `systems` rows incl. fake OSS/S3/Qiniu AK/SK. Served via `php -S` front controller. APP_DEBUG=false, APP_LOG_LEVEL=error (prod-like).
+
+- F1 confirmed: `GET /api/admin/web/logs/settings.all` → **HTTP 200**, body is the log viewer (`<title>管理日志</title>`, contains `?l=`/`?dl=`/`delall`). Control random token → **HTTP 401**. So the bypass is specifically "attacker supplies a live cache key". Admin API `GET /api/admin/system/storage` unauth → **401** (properly protected).
+- F2 confirmed: admin's authenticated `POST /api/admin/system/info` (valid JWT, missing `app_url`) → uncaught ErrorException → **HTTP 500**, and the handler wrote the full `Authorization: Bearer eyJ...` into `storage/logs/card_cli-server-*.log` (grep-confirmed server-side).
+- FULL CHAIN confirmed (attacker = pure unauth HTTP): (1) GET log viewer via F1 → scraped the admin JWT from rendered logs; (2) replayed `Authorization: Bearer <stolen>` to `GET /api/admin/system/storage` → **HTTP 200** returning `storage_oss_access_key=LTAI5tFAKEDEMOAccessKeyId01`, `storage_oss_secret_key=wJalrFAKEDEMOsecretKeyEXAMPLE1234abcdOSS`, plus S3 + Qiniu AK/SK. = **unauthenticated AK/SK disclosure**.
+- F1 secondary impact confirmed: unauth `GET /api/admin/web/logs/settings.all?delall=true` → **HTTP 302**, then `storage/logs/*.log` count = **0** (all logs wiped, no crypto token needed) → anti-forensics.
+
+
 ## Framework dictionary
 - Laravel 5.5, PHP >=7.0. JWT auth (tymon/jwt-auth 1.0.0-rc.5).
 - Routes: `routes/api.php` is mounted under **`/api`** prefix (RouteServiceProvider::mapApiRoutes), middleware group `api` = **only `bindings`** (NO auth, NO throttle). `routes/web.php` not prefixed, group `web` = BladeMinify only.
@@ -37,7 +46,7 @@ Stored in `system` key-value table via `App\System::_get/_set`; loaded into live
 - Reachability: UNAUTH, 0-click. Cache driver default `file` (.env.example CACHE_DRIVER=file).
 - Log viewer version v0.13.0: `l`/`dl` params use `\Crypt::decrypt` (need APP_KEY) so arbitrary-path read needs APP_KEY; BUT index page (resources/views/vendor/laravel-log-viewer/log.blade.php) server-generates valid encrypted switch-links for EVERY `storage/logs/*.log`, renders full log table (level/context/date/text/stack), AND exposes `?dl=`(download) and `?del=`/`?delall=true`(delete).
 - EXTRA: `?delall=true` needs NO crypto token → unauth attacker can WIPE all logs (anti-forensics / log destruction).
-- Other always-present truthy cache keys usable as the bypass token: `settings.all`, `model.pays`.
+- Bypass token: `settings.all` is reliably present on EVERY request (ConfigServiceProvider → System::_init → Cache::remember). `model.pays` only after a Pay::gets() call (verified: returns 401 when not yet populated), so `settings.all` is the dependable key.
 - Verified: shop_theme/admin blade views echo only curated config (app.logo/name/project) + pays(id/name/img); NO secret echo. `js_tj`/`js_kf` are raw admin JS (stored XSS, admin-set, not AKSK).
 - Verified: `systems` table = (name UNIQUE, value longText) KV; secrets stored here. `Pay->config` holds gateway merchant secrets (not exposed to shop).
 
